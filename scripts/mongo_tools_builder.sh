@@ -163,6 +163,11 @@ install_deps() {
     fi
     [ "$(id -u)" -eq 0 ] || abort "It is not possible to instal dependencies. Please run as root"
     if [ "x$OS" = "xrpm" ]; then
+      if [ x"$RHEL" = x7 ]; then
+        # centos 7 is EOL, mirror.centos.org is gone
+        sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
+        sed -i 's|#\s*baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
+      fi
       yum -y install wget git tar which findutils diffutils
       # gcc + krb5-devel: the `gssapi` build tag is cgo, linking -lgssapi_krb5 -lkrb5
       yum -y install gcc krb5-devel
@@ -179,6 +184,10 @@ install_deps() {
       yum -y install rpm-build rpmlint
     else
       export DEBIAN_FRONTEND=noninteractive
+      # bullseye is EOL: deb.debian.org still has the security index but the pool is gone (404)
+      if grep -q '^VERSION_CODENAME=bullseye$' /etc/os-release; then
+        sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list
+      fi
       apt-get -y update
       apt-get -y install wget git tar lsb-release
       apt-get -y install gcc libkrb5-dev
@@ -365,11 +374,33 @@ get_source_rpm_package() {
 
 get_deb_sources() {
     local ext=$1
+    local optional=$2
     [ -n "$ext" ] || abort '`get_deb_sources`: empty or missing extension argument'
     local filepath=$(find "$WORKDIR/source_deb" -name "${PRODUCT}*.$ext" 2>/dev/null | sort | tail -n1)
     [ -n "$filepath" ] || filepath=$(find "$CURDIR/source_deb" -name "${PRODUCT}*.$ext" 2>/dev/null | sort | tail -n1)
+    if [ -z "$filepath" ] && [ "x$optional" = "xoptional" ]; then
+        echo "get_deb_sources: no *.$ext, skipping"
+        return
+    fi
     [ -n "$filepath" ] || abort 'source deb package does not exist; add the `--build_src_deb` option to create it'
     cp "$filepath" "$WORKDIR/" || abort "\`get_deb_sources\`: failed to copy \`$filepath\`"
+}
+
+# released sources taken from downloads come without the properties file,
+# so take version-release from the source file name ($1 = <version>-<release>)
+load_properties() {
+    local vr="$1"
+    if [ -r "${WORKDIR}/${PROPERTIES}" ] && grep -q '^VERSION=' "${WORKDIR}/${PROPERTIES}"; then
+        source "${WORKDIR}/${PROPERTIES}"
+        return
+    fi
+    case "$vr" in
+        *-*) ;;
+        *) abort "\`load_properties\`: no ${PROPERTIES} and can't get version-release from \`$vr\`" ;;
+    esac
+    VERSION=${vr%-*}
+    RELEASE=${vr##*-}
+    echo "load_properties: no ${PROPERTIES}, using ${VERSION}-${RELEASE} from the file name"
 }
 
 build_srpm(){
@@ -478,19 +509,21 @@ build_deb(){
         return;
     fi
     [ "x$OS" = "xdeb" ] || abort "Can't build deb on a non-deb-based OS"
-    for file in 'dsc' 'orig.tar.gz' 'changes' 'debian.tar*'
+    for file in 'dsc' 'orig.tar.gz' 'debian.tar*'
     do
         get_deb_sources $file
     done
+    # not published on downloads, and dpkg-source -x doesn't need it
+    get_deb_sources 'changes' optional
     cd "$WORKDIR" || abort "cannot cd to \`$WORKDIR\`"
     rm -fv *.deb
+    DSC=$(basename $(find . -maxdepth 1 -name "${PRODUCT}_*.dsc" | sort | tail -n1))
     export DEBIAN=$(lsb_release -sc)
     export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
     echo "DEBIAN=${DEBIAN}" >> "${PROPERTIES}"
     echo "ARCH=${ARCH}" >> "${PROPERTIES}"
-    source "${WORKDIR}/${PROPERTIES}"
+    load_properties "$(basename "$DSC" .dsc | sed -e "s/^${PRODUCT}_//")"
 
-    DSC=$(basename $(find . -name '*.dsc' | sort | tail -n1))
     dpkg-source -x ${DSC} || abort '`dpkg-source -x` failed'
     cd "${PRODUCT}-${VERSION}" || abort "cannot cd to \`${PRODUCT}-${VERSION}\`"
 
@@ -523,13 +556,15 @@ build_tarball(){
     fi
     cd "$WORKDIR" || abort "cannot cd to \`$WORKDIR\`"
     TARFILE="$(get_source_tarball)"
-    source "${WORKDIR}/${PROPERTIES}"
-
     SRCDIR=${TARFILE%.tar.gz}
+    load_properties "${SRCDIR#${PRODUCT}-}"
+
     rm -rf "${SRCDIR}"
     tar xzf "${TARFILE}" || abort '`tar` failed to unpack the source tarball'
 
     compile_tools "${WORKDIR}/${SRCDIR}" "${WORKDIR}/build_tools"
+    # compile_tools sourced set_tools_revision.sh; without properties that is the only commit we have
+    TOOLS_COMMIT=${TOOLS_COMMIT:-$PSMDB_TOOLS_COMMIT_HASH}
 
     cd "$WORKDIR" || abort "cannot cd to \`$WORKDIR\`"
     # same suffix as the server tarballs: ol<N> for rpm OSes (amzn too), codename for deb.
